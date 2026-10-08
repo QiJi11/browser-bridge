@@ -138,6 +138,26 @@ node --test tests/test_poll_server.mjs          # poll：8 用例（含 5 个反
 
 测试用独立端口（28786/28777）与临时目录，不碰默认端口和本目录数据。
 
+### 真实浏览器验证（已做）
+
+除单元测试外，两种模式都在真实 Chrome（154.0.8037.98）+ 真实加载的扩展上跑过完整闭环：
+
+- **ws**：`status` / `open https://example.com`（load complete）/ `read`（正文+链接）；
+  白名单反向验证：`open https://www.google.com` → 被拒（host not in ALLOWED_HOSTS）
+- **poll**：`PING` 与 `OPEN_READ` 任务经 alarm 自然轮询被领取 → 执行 → `job_result` +
+  `task_done` 回执写入 receipts.jsonl → task.json 结案
+
+### 加载扩展的两个坑（实测）
+
+1. **命令行 `--load-extension` 在新版 Chrome 已失效**（实测 154 不加载）。日常用
+   `chrome://extensions` 开发者模式手动加载；自动化环境用
+   `--enable-unsafe-extension-debugging` + CDP `Extensions.loadUnpacked`
+   （脚本：[tests/load_extension_cdp.py](tests/load_extension_cdp.py)）。
+2. **poll 扩展的 `host_permissions` 必须包含 `http://127.0.0.1/*`**，否则扩展 SW 的
+   `fetch` 被拦（报 "Failed to fetch"，且失败会被 catch 吞掉、表现为"任务没反应"）。
+   manifest 已内置；若改端口或改走 https 本地服务，记得同步改 host_permissions。
+   （ws 模式的 WebSocket 连接不受此限制，实测无需声明。）
+
 ## 来源
 
 抽取自作者本地两条实战链路（taobao 只读桥 / boss-hunter 投递桥），去业务化后的通用版本。
