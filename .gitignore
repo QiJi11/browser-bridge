@@ -1,0 +1,24 @@
+# 运行时产物与凭据：绝不入库
+.bridge_token
+*.log
+*.err
+state.json
+task.json
+receipts.jsonl
+data/
+out/
+__pycache__/
+*.pyc
+node_modules/
+.venv/
+venv/
+.pytest_cache/
+
+# 本地浏览器 profile / 凭据导出（历史上事故高发区，显式兜底）
+chrome-profile*/
+*-profile*/
+*profile-*/
+*cookies*
+*auth-export*
+*session*
+*.sqlite
