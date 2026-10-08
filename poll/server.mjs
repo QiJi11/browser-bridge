@@ -18,12 +18,13 @@
 //          BRIDGE_EXTENSION_ORIGIN（可选，精确锁死你的扩展 ID，如 chrome-extension://abcd...）
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PORT = Number(process.env.BRIDGE_PORT) || 17777;
 const DATA_DIR = process.env.BRIDGE_DATA_DIR || dirname(fileURLToPath(import.meta.url));
+mkdirSync(DATA_DIR, { recursive: true });
 const TOKEN_FILE = join(DATA_DIR, '.bridge_token');
 const TASK_FILE = join(DATA_DIR, 'task.json');
 const STATE_FILE = join(DATA_DIR, 'state.json');
