@@ -80,6 +80,8 @@ node poll/ctl.mjs status
 
 **任务保护**：`ctl.mjs task` 会拒绝覆盖未完成的 `task.json`；先执行 `status`、查看 `receipts`，确认后才通过 `reset` 明确放弃任务。失败后的 PING/OPEN_READ 允许重试，但不保证 exactly-once；未来新增任何写操作都必须设计服务端幂等键。
 
+**持久化失败必须明确失败**：`/result` 在状态文件无法读写时返回 503，不会把失败伪装为成功；`/task` 遇到损坏的任务文件也返回 503。文件写入成功不等于断电后的严格持久化保证，仍需要在真实机器上演练备份与恢复。
+
 ## 安全模型（必读）
 
 这套桥把"浏览器里的登录态"暴露给了本机进程，边界必须清楚（详见 [docs/security.md](docs/security.md)）：
@@ -147,7 +149,7 @@ tests/
 
 ```bash
 python -m pytest tests/test_ws_server.py -v     # ws：9 用例（模拟扩展）
-node --test tests/test_poll_server.mjs tests/test_poll_cli.mjs tests/test_poll_extension.mjs tests/test_injected_origin_guard.mjs  # 22 用例，纯模拟
+node --test tests/test_poll_server.mjs tests/test_poll_cli.mjs tests/test_poll_extension.mjs tests/test_injected_origin_guard.mjs tests/test_poll_startup.mjs  # 28 用例，隔离/模拟
 ```
 
 测试用独立端口（28786/28777）与临时目录，不碰默认端口和本目录数据。
