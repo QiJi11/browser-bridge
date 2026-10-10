@@ -20,6 +20,7 @@ const DATA_DIR = mkdtempSync(join(tmpdir(), 'pollbridge-'));
 const TASK_FILE = join(DATA_DIR, 'task.json');
 const RECEIPTS_FILE = join(DATA_DIR, 'receipts.jsonl');
 const TOKEN_FILE = join(DATA_DIR, '.bridge_token');
+const EXT_ORIGIN = 'chrome-extension://' + 'a'.repeat(32);
 
 let proc;
 let TOKEN;
@@ -47,7 +48,7 @@ function req(method, path, { token, origin, body } = {}) {
 
 before(async () => {
   proc = spawn(process.execPath, [join(ROOT, 'poll', 'server.mjs')], {
-    env: { ...process.env, BRIDGE_PORT: String(PORT), BRIDGE_DATA_DIR: DATA_DIR },
+    env: { ...process.env, BRIDGE_PORT: String(PORT), BRIDGE_DATA_DIR: DATA_DIR, BRIDGE_EXTENSION_ORIGIN: EXT_ORIGIN },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   proc.stdout.on('data', () => {});
@@ -97,10 +98,24 @@ test('rejects web-page origin on preflight', async () => {
   assert.equal(r.status, 403);
 });
 
-test('allows extension origin on preflight', async () => {
-  const origin = 'chrome-extension://' + 'a'.repeat(32);
-  const r = await req('OPTIONS', '/health', { origin });
+test('allows exact configured extension origin on preflight', async () => {
+  const r = await req('OPTIONS', '/health', { origin: EXT_ORIGIN });
   assert.equal(r.status, 204);
+});
+
+test('rejects other extension Origin despite chrome-extension scheme', async () => {
+  const r = await req('OPTIONS', '/health', { origin: 'chrome-extension://' + 'b'.repeat(32) });
+  assert.equal(r.status, 403);
+});
+
+test('rejects token in URL query even if otherwise valid', async () => {
+  const r = await req('GET', '/health?token=' + encodeURIComponent(TOKEN));
+  assert.equal(r.status, 403);
+});
+
+test('accepts local CLI with token header', async () => {
+  const r = await req('GET', '/health', { token: TOKEN });
+  assert.equal(r.status, 200);
 });
 
 // ── 正向用例 ──────────────────────────────────────────────
