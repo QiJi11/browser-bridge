@@ -99,8 +99,10 @@ async function handle(msg) {
         throw new Error("host not in ALLOWED_HOSTS: " + msg.url);
       }
       const tab = await getTab();
+      // Register before navigating; a fast navigation may complete before tabs.update resolves.
+      const completed = waitComplete(tab.id);
       await chrome.tabs.update(tab.id, { url: msg.url, active: true });
-      const st = await waitComplete(tab.id);
+      const st = await completed;
       const t = await chrome.tabs.get(tab.id);
       if (!hostAllowed(t.url || "")) throw new Error("bridge tab redirected outside ALLOWED_HOSTS");
       return { load: st, url: t.url, title: t.title };
