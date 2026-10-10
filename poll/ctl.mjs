@@ -28,7 +28,7 @@ function token() {
 }
 
 async function health() {
-  const r = await fetch(`http://127.0.0.1:${PORT}/health?token=${token()}`);
+  const r = await fetch(`http://127.0.0.1:${PORT}/health`, { headers: { 'x-bridge-token': token() } });
   return r.json();
 }
 
