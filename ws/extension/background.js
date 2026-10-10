@@ -20,7 +20,9 @@ let bridgeTabId = null;
 
 function hostAllowed(url) {
   try {
-    const h = new URL(url).hostname;
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return false;
+    const h = parsed.hostname;
     return ALLOWED_HOSTS.some((d) => h === d || h.endsWith("." + d));
   } catch {
     return false;
@@ -63,6 +65,12 @@ async function getTab() {
   return t;
 }
 
+async function getAllowedTab() {
+  const tab = await getTab();
+  if (!hostAllowed(tab.url || "")) throw new Error("bridge tab is outside ALLOWED_HOSTS");
+  return tab;
+}
+
 function waitComplete(tabId, timeoutMs = 45000) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(fn); resolve("timeout"); }, timeoutMs);
@@ -94,14 +102,15 @@ async function handle(msg) {
       await chrome.tabs.update(tab.id, { url: msg.url, active: true });
       const st = await waitComplete(tab.id);
       const t = await chrome.tabs.get(tab.id);
+      if (!hostAllowed(t.url || "")) throw new Error("bridge tab redirected outside ALLOWED_HOSTS");
       return { load: st, url: t.url, title: t.title };
     }
     case "scroll": {
-      const tab = await getTab();
+      const tab = await getAllowedTab();
       return run(tab.id, (dy) => { window.scrollBy({ top: dy, behavior: "smooth" }); return window.scrollY; }, [msg.dy || 800]);
     }
     case "read": {
-      const tab = await getTab();
+      const tab = await getAllowedTab();
       return run(tab.id, (maxText) => {
         const links = [];
         document.querySelectorAll("a[href]").forEach((a) => {
@@ -124,7 +133,7 @@ async function handle(msg) {
     }
     case "click": {
       if (!allowWrite) throw new Error("write actions disabled (allowWrite=false)");
-      const tab = await getTab();
+      const tab = await getAllowedTab();
       return run(tab.id, (sel) => {
         const el = document.querySelector(sel);
         if (!el) return { clicked: false, reason: "not found" };
