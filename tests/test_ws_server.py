@@ -17,7 +17,6 @@ import os
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
 
 import pytest
@@ -36,6 +35,7 @@ def server():
         "BRIDGE_PORT": str(PORT),
         "BRIDGE_TOKEN_FILE": str(TOKEN_FILE),
         "BRIDGE_REPLY_TIMEOUT": "2",
+        "BRIDGE_EXTENSION_ORIGIN": EXT_ORIGIN["Origin"],
     }
     proc = subprocess.Popen(
         [sys.executable, str(WS_DIR / "server.py")],
@@ -69,7 +69,8 @@ def token() -> str:
     return TOKEN_FILE.read_text(encoding="utf-8").strip()
 
 
-EXT_ORIGIN = {"Origin": "chrome-extension://" + uuid.uuid4().hex[:32]}
+EXT_ORIGIN = {"Origin": "chrome-extension://" + "a" * 32}
+OTHER_EXT_ORIGIN = {"Origin": "chrome-extension://" + "b" * 32}
 
 
 async def connect_ext():
@@ -111,6 +112,30 @@ def test_ext_requires_extension_origin(server):
             assert ei.value.rcvd is not None and ei.value.rcvd.code == 1008
         except websockets.InvalidStatus as e:
             assert e.response.status_code == 403
+    run(go())
+
+
+def test_ext_rejects_other_extension_even_with_valid_scheme(server):
+    async def go():
+        ws = await websockets.connect(
+            f"ws://127.0.0.1:{PORT}/ext", additional_headers=OTHER_EXT_ORIGIN
+        )
+        with pytest.raises(websockets.ConnectionClosed) as ei:
+            await ws.recv()
+        assert ei.value.rcvd is not None and ei.value.rcvd.code == 1008
+    run(go())
+
+
+def test_ext_rejects_second_connection(server):
+    async def go():
+        first = await connect_ext()
+        try:
+            second = await connect_ext()
+            with pytest.raises(websockets.ConnectionClosed) as ei:
+                await second.recv()
+            assert ei.value.rcvd is not None and ei.value.rcvd.code == 1008
+        finally:
+            await first.close()
     run(go())
 
 
