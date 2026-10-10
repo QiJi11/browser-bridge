@@ -21,8 +21,8 @@
 |---|---|---|
 | 通道 | WebSocket 长连接 | HTTP 轮询（chrome.alarms） |
 | 延迟 | 低，实时 | 一个轮询周期（≥30s） |
-| 断连恢复 | 自动重连 | 天然耐断，server 重启不丢任务 |
-| 任务语义 | 无状态转发（一问一答） | 任务单 + 回执流水 + taskId 幂等 |
+| 断连恢复 | 自动重连 | 任务文件持久化，失败可重试；只读动作可能重复执行 |
+| 任务语义 | 无状态转发（一问一答） | 单任务槽位 + 回执流水 + 成功确认后标记完成（非 exactly-once） |
 | 适合 | 交互式读取、爬取、调试 | 无人值守批量任务、要审计的场景 |
 
 选型一句话：**要实时互动用 `ws/`，要"发单-执行-留痕"用 `poll/`。**
@@ -78,6 +78,8 @@ node poll/ctl.mjs receipts 5            # 看回执
 node poll/ctl.mjs status
 ```
 
+**任务保护**：`ctl.mjs task` 会拒绝覆盖未完成的 `task.json`；先执行 `status`、查看 `receipts`，确认后才通过 `reset` 明确放弃任务。失败后的 PING/OPEN_READ 允许重试，但不保证 exactly-once；未来新增任何写操作都必须设计服务端幂等键。
+
 ## 安全模型（必读）
 
 这套桥把"浏览器里的登录态"暴露给了本机进程，边界必须清楚（详见 [docs/security.md](docs/security.md)）：
@@ -87,7 +89,7 @@ node poll/ctl.mjs status
   网页拿不到。poll 模式的 token 持久化在 `.bridge_token`（删掉即轮换，扩展要重新配置）。
 - **Origin 校验**：`/ctl` 拒绝任何带 `Origin` 的连接（网页发起的 WebSocket 必带 Origin）；
   `/ext` 与 poll 服务器均强制要求 `BRIDGE_EXTENSION_ORIGIN` 精确匹配已加载扩展 ID。其他扩展即使使用同样的 `chrome-extension://` 前缀也被拒绝；单靠 Origin 仍不能防御完全控制本机的进程。
-- **站点白名单**：扩展侧的 `ALLOWED_HOSTS` 与 manifest `host_permissions` 是两道独立边界。默认只允许示例 HTTPS 站点，读/滚动/点击操作及跳转后也会重新检查域名；变更目标域名必须同步修改两处。
+- **站点白名单**：扩展侧的 `ALLOWED_HOSTS` 与 manifest `host_permissions` 是两道独立边界。默认只允许示例 HTTPS 站点。除调用前与跳转后校验外，读取/滚动/点击还在页面实际脚本执行时再次校验，阻断导航竞态。变更目标域名必须同步修改两处。
 - **写操作默认关闭**：`ws` 模式的 `click` 需要把 `allowWrite` 改成 `true` 才生效。
 - **别把桥暴露给公网**：浏览器对 localhost 的访问限制（Chrome 的 Local Network Access）目前
   **尚未覆盖 WebSocket**，恶意网页直连你本机端口这件事不能指望浏览器拦，token + Origin 是硬要求。
@@ -132,7 +134,7 @@ ws/                   推模式（WebSocket，低延迟）
 poll/                 拉模式（HTTP 轮询，任务单 + 回执）
   server.mjs          任务桥服务：/task 领任务、/result 回执、receipts.jsonl 审计流水
   ctl.mjs             控制端：写任务 / 看状态 / 看回执
-  extension/          MV3 扩展：轮询领任务、taskId 幂等、串行执行
+  extension/          MV3 扩展：轮询领任务、服务端确认后标记完成、串行执行
 docs/
   security.md         威胁模型与防护
   landscape.md        生态与关键词调研
@@ -145,7 +147,7 @@ tests/
 
 ```bash
 python -m pytest tests/test_ws_server.py -v     # ws：9 用例（模拟扩展）
-node --test tests/test_poll_server.mjs          # poll：11 用例（模拟任务）
+node --test tests/test_poll_server.mjs tests/test_poll_cli.mjs tests/test_poll_extension.mjs tests/test_injected_origin_guard.mjs  # 22 用例，纯模拟
 ```
 
 测试用独立端口（28786/28777）与临时目录，不碰默认端口和本目录数据。
