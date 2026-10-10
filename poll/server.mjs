@@ -44,13 +44,21 @@ if (existsSync(TOKEN_FILE)) {
   writeFileSync(TOKEN_FILE, TOKEN, { mode: 0o600, flag: "wx" });
   console.log('[bridge] generated new token -> ' + TOKEN_FILE);
 }
+// An empty or predictably short token must not turn localhost into an unauthenticated API.
+if (!/^[A-Za-z0-9_-]{32,128}$/.test(TOKEN)) {
+  console.error('[bridge] invalid bridge token file; stop and rotate it offline');
+  process.exit(2);
+}
 
 function readTask() {
-  try {
-    const t = JSON.parse(readFileSync(TASK_FILE, 'utf8'));
-    if (t && t.action && t.done !== true) return t;
-  } catch {}
-  return { action: 'NONE' };
+  if (!existsSync(TASK_FILE)) return { action: 'NONE' };
+  const t = JSON.parse(readFileSync(TASK_FILE, 'utf8'));
+  if (!t || typeof t !== 'object' || Array.isArray(t) || typeof t.action !== 'string') {
+    throw new Error('invalid task file');
+  }
+  if (t.action === 'NONE' || t.done === true) return { action: 'NONE' };
+  if (typeof t.id !== 'string' || !t.id) throw new Error('invalid active task id');
+  return t;
 }
 
 function readState() {
@@ -103,7 +111,12 @@ const server = http.createServer((req, res) => {
     return json(res, 200, { ok: true, port: PORT, dataDir: DATA_DIR });
   }
   if (req.method === 'GET' && u.pathname === '/task') {
-    return json(res, 200, readTask());
+    try {
+      return json(res, 200, readTask());
+    } catch (error) {
+      console.error('[bridge] task file unavailable: ' + String(error?.code || error?.name || 'invalid'));
+      return json(res, 503, { error: 'TASK_STATE_UNAVAILABLE' });
+    }
   }
   if (req.method === 'POST' && u.pathname === '/result') {
     let d = '';
