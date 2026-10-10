@@ -46,7 +46,9 @@ function sleep(ms) {
 
 function hostAllowed(url) {
   try {
-    const h = new URL(url).hostname;
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return false;
+    const h = parsed.hostname;
     return ALLOWED_HOSTS.some((d) => h === d || h.endsWith("." + d));
   } catch {
     return false;
@@ -62,6 +64,8 @@ async function handleAction(task) {
       if (!hostAllowed(task.url || "")) throw new Error("host not in ALLOWED_HOSTS: " + task.url);
       const tab = await chrome.tabs.create({ url: task.url, active: true });
       await waitComplete(tab.id);
+      const current = await chrome.tabs.get(tab.id);
+      if (!hostAllowed(current.url || "")) throw new Error("bridge tab redirected outside ALLOWED_HOSTS");
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: (maxText) => ({
