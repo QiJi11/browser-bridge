@@ -30,8 +30,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Node HTTP polling, simulated MV3 recovery and CLI safety
-        run: node --test tests/test_poll_server.mjs tests/test_poll_extension.mjs tests/test_poll_cli.mjs
+      - name: Node HTTP polling, simulated MV3 recovery, CLI and injected-origin checks
+        run: node --test tests/test_poll_server.mjs tests/test_poll_extension.mjs tests/test_poll_cli.mjs tests/test_injected_origin_guard.mjs
       - name: Validate extension scripts
         run: |
           node --check ws/extension/background.js
