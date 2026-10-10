@@ -1,9 +1,6 @@
 name: Bridge isolated regression
 
 on:
-  push:
-    branches:
-      - security/review-origin-boundary-20261011
   pull_request:
     branches:
       - main
