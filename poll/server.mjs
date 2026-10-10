@@ -15,7 +15,7 @@
 // 幂等由扩展侧 taskId 去重保证（SW 重启不会重跑同一任务）。
 //
 // 环境变量：BRIDGE_PORT(17777) / BRIDGE_DATA_DIR / BRIDGE_SELF_EXIT_MS（测试自退）
-//          BRIDGE_EXTENSION_ORIGIN（可选，精确锁死你的扩展 ID，如 chrome-extension://abcd...）
+//          BRIDGE_EXTENSION_ORIGIN（必填，精确绑定 chrome-extension://<32 位扩展 ID>）
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
@@ -29,7 +29,11 @@ const TOKEN_FILE = join(DATA_DIR, '.bridge_token');
 const TASK_FILE = join(DATA_DIR, 'task.json');
 const STATE_FILE = join(DATA_DIR, 'state.json');
 const RECEIPTS_FILE = join(DATA_DIR, 'receipts.jsonl');
-const LOCKED_ORIGIN = process.env.BRIDGE_EXTENSION_ORIGIN || null; // 可选：精确扩展 ID
+const LOCKED_ORIGIN = (process.env.BRIDGE_EXTENSION_ORIGIN || '').trim();
+if (!/^chrome-extension:\/\/[a-p]{32}$/.test(LOCKED_ORIGIN)) {
+  console.error('[bridge] BRIDGE_EXTENSION_ORIGIN must be the exact chrome-extension://<32-letter-extension-id>');
+  process.exit(2);
+}
 
 // token 持久化：重启 server 不失效（扩展侧只配置一次）
 let TOKEN;
@@ -37,7 +41,7 @@ if (existsSync(TOKEN_FILE)) {
   TOKEN = readFileSync(TOKEN_FILE, 'utf8').trim();
 } else {
   TOKEN = crypto.randomBytes(24).toString('base64url');
-  writeFileSync(TOKEN_FILE, TOKEN);
+  writeFileSync(TOKEN_FILE, TOKEN, { mode: 0o600, flag: "wx" });
   console.log('[bridge] generated new token -> ' + TOKEN_FILE);
 }
 
@@ -65,8 +69,7 @@ function json(res, code, obj) {
 function originOk(req) {
   const origin = req.headers.origin || '';
   if (!origin) return true; // curl / 本机脚本不带 Origin
-  if (LOCKED_ORIGIN) return origin === LOCKED_ORIGIN;
-  return origin.startsWith('chrome-extension://');
+  return origin === LOCKED_ORIGIN;
 }
 
 const server = http.createServer((req, res) => {
@@ -86,7 +89,7 @@ const server = http.createServer((req, res) => {
   }
   if (!originOk(req)) return json(res, 403, { error: 'bad origin' });
 
-  const auth = req.headers['x-bridge-token'] === TOKEN || u.searchParams.get('token') === TOKEN;
+  const auth = req.headers['x-bridge-token'] === TOKEN;
   if (!auth) return json(res, 403, { error: 'bad token' });
 
   if (req.method === 'GET' && u.pathname === '/health') {
@@ -122,7 +125,7 @@ const server = http.createServer((req, res) => {
         } catch {}
       }
       writeState(state);
-      console.log('[bridge] result: ' + JSON.stringify(r).slice(0, 400));
+      console.log('[bridge] receipt: ' + JSON.stringify({ type: r.type, taskId: r.taskId, ok: r.ok }));
       return json(res, 200, { ok: true });
     });
     return;
