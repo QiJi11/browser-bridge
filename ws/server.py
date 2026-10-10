@@ -7,11 +7,12 @@
   * 只绑定 127.0.0.1，不对外网开放
   * /ctl 需要启动时生成的随机 token；token 只写本机文件，网页拿不到
   * /ctl 拒绝任何带 Origin 的连接（网页发起的 WebSocket 一定带 Origin）
-  * /ext 只接受 chrome-extension:// 起源
+  * /ext 只接受 BRIDGE_EXTENSION_ORIGIN 中指定的唯一 Chrome 扩展 Origin
 
 环境变量：
   BRIDGE_PORT           默认 18786
   BRIDGE_REPLY_TIMEOUT  单条命令等待扩展回复的秒数，默认 90
+  BRIDGE_EXTENSION_ORIGIN  必填；chrome-extension:// 后接 32 位扩展 ID
   BRIDGE_TOKEN_FILE     token 落盘路径，默认与本文件同目录的 .bridge_token
 
 依赖：pip install websockets
@@ -21,6 +22,7 @@ import hmac
 import itertools
 import json
 import os
+import re
 import secrets
 import sys
 from urllib.parse import parse_qs, urlsplit
@@ -37,6 +39,9 @@ TOKEN_FILE = os.environ.get("BRIDGE_TOKEN_FILE") or os.path.join(
 )
 # 每次启动生成随机口令，只写到本机文件；控制端读文件拿口令。
 TOKEN = secrets.token_urlsafe(24)
+LOCKED_ORIGIN = os.environ.get("BRIDGE_EXTENSION_ORIGIN", "").strip()
+if not re.fullmatch(r"chrome-extension://[a-p]{32}", LOCKED_ORIGIN):
+    raise SystemExit("Set BRIDGE_EXTENSION_ORIGIN to the exact chrome-extension://<32-letter-extension-id> before starting")
 
 ext = None
 pending = {}
@@ -49,8 +54,8 @@ async def handler(conn):
     path = parts.path
     origin = conn.request.headers.get("Origin", "") or ""
     if path == "/ext":
-        # 普通网页的 Origin 是 http(s)://，只有扩展的 Origin 是 chrome-extension://
-        if not origin.startswith("chrome-extension://"):
+        # Fail closed: other extensions also use chrome-extension://, so prefix checks are insufficient.
+        if not hmac.compare_digest(origin, LOCKED_ORIGIN) or ext is not None:
             await conn.close(code=1008, reason="forbidden")
             return
         ext = conn
@@ -96,6 +101,8 @@ async def handler(conn):
 async def main():
     with open(TOKEN_FILE, "w", encoding="utf-8") as f:
         f.write(TOKEN)
+    if os.name != "nt":
+        os.chmod(TOKEN_FILE, 0o600)
     async with websockets.serve(handler, HOST, PORT, max_size=32 * 1024 * 1024):
         print(f"bridge listening ws://{HOST}:{PORT}", flush=True)
         await asyncio.Future()
