@@ -91,13 +91,23 @@ async function handleAction(task) {
 
 function waitComplete(tabId, timeoutMs = 45000) {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(fn); resolve("timeout"); }, timeoutMs);
+    let settled = false;
+    const timer = setTimeout(() => finish("timeout"), timeoutMs);
+    function finish(status) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(fn);
+      resolve(status);
+    }
     function fn(id, info) {
-      if (id === tabId && info.status === "complete") {
-        clearTimeout(timer); chrome.tabs.onUpdated.removeListener(fn); resolve("complete");
-      }
+      if (id === tabId && info.status === "complete") finish("complete");
     }
     chrome.tabs.onUpdated.addListener(fn);
+    // tabs.create may return after the document already finished loading.
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab.status === "complete") finish("complete");
+    }).catch(() => finish("error"));
   });
 }
 
