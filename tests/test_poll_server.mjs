@@ -210,3 +210,16 @@ test('malformed existing state must not silently reset idempotency history', asy
     writeFileSync(STATE_FILE, saved);
   }
 });
+
+test('corrupt pending task returns 503 instead of a misleading empty queue', async () => {
+  const saved = readFileSync(TASK_FILE, 'utf8');
+  writeFileSync(TASK_FILE, '{truncated-task');
+  try {
+    const r = await req('GET', '/task', { token: TOKEN });
+    assert.equal(r.status, 503);
+    assert.equal(r.body.error, 'TASK_STATE_UNAVAILABLE');
+    assert.equal(readFileSync(TASK_FILE, 'utf8'), '{truncated-task');
+  } finally {
+    writeFileSync(TASK_FILE, saved);
+  }
+});
