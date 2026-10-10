@@ -13,7 +13,7 @@ const scripts = {
   poll: readFileSync(join(root, 'poll', 'extension', 'background.js'), 'utf8'),
 };
 
-function browser(mode, injectedHostname) {
+function browser(mode, injectedHostname, { instantNavigation = false } = {}) {
   const state = { reads: 0, scrolls: 0, clicks: 0 };
   const location = { hostname: injectedHostname, protocol: 'https:', href: 'https://' + injectedHostname + '/' };
   const document = {
@@ -25,12 +25,25 @@ function browser(mode, injectedHostname) {
   };
   const window = { scrollY: 0, scrollBy() { state.scrolls++; } };
   const tab = { id: 1, url: 'https://example.com/', title: 'Allowed (before redirect)', status: 'complete' };
+  const listeners = new Set();
   const fakeEvents = {
-    addListener(fn) { queueMicrotask(() => fn(tab.id, { status: 'complete' })); },
-    removeListener() {},
+    addListener(fn) {
+      listeners.add(fn);
+      if (!instantNavigation) queueMicrotask(() => fn(tab.id, { status: 'complete' }));
+    },
+    removeListener(fn) { listeners.delete(fn); },
   };
   const chrome = {
-    tabs: { create: async () => tab, get: async () => tab, update: async () => tab, onUpdated: fakeEvents },
+    tabs: {
+      create: async () => tab,
+      get: async () => tab,
+      update: async (_id, change) => {
+        tab.url = change.url;
+        if (instantNavigation) for (const fn of listeners) fn(tab.id, { status: 'complete' });
+        return tab;
+      },
+      onUpdated: fakeEvents,
+    },
     scripting: { executeScript: async ({ func, args }) => [{ result: func(...args) }] },
     storage: { local: { get: async (key) => ({ [key]: 'synthetic-token' }), set: async () => {} } },
     alarms: { create() {}, onAlarm: { addListener() {} } },
@@ -78,4 +91,22 @@ test('poll OPEN_READ accepts the allowed page', async () => {
   const x = browser('poll', 'example.com');
   const output = await x.command('handleAction({action:"OPEN_READ", url:"https://example.com/"})');
   assert.equal(output.text, 'synthetic protected text');
+});
+
+test('WS open observes a navigation completing synchronously inside tabs.update', async () => {
+  const x = browser('ws', 'example.com', { instantNavigation: true });
+  const outcome = await Promise.race([
+    x.command('handle({cmd:"open", url:"https://example.com/"})'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('navigation event was missed')), 500)),
+  ]);
+  assert.equal(outcome.load, 'complete');
+});
+
+test('poll OPEN_READ handles a new tab that was already complete on return', async () => {
+  const x = browser('poll', 'example.com', { instantNavigation: true });
+  const result = await Promise.race([
+    x.command('handleAction({action:"OPEN_READ", url:"https://example.com/"})'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('already-loaded tab was missed')), 500)),
+  ]);
+  assert.equal(result.text, 'synthetic protected text');
 });
