@@ -64,7 +64,7 @@ function readState() {
 }
 
 function writeState(s) {
-  // A successful /result must mean the completion state was really saved.
+  // A successful /result means its completion state write succeeded (not a power-loss fsync guarantee).
   writeFileSync(STATE_FILE, JSON.stringify(s, null, 1));
 }
 
@@ -132,8 +132,8 @@ const server = http.createServer((req, res) => {
           state.doneTaskIds.push(r.taskId);
           if (state.doneTaskIds.length > 200) state.doneTaskIds = state.doneTaskIds.slice(-200);
         }
-        // Persist the state *before* completing task.json; on any failure the
-        // extension gets 503 and can retry without losing the pending task.
+        // Write state *before* completing task.json; on any failure the
+        // extension gets 503 and can retry rather than silently losing pending work.
         writeState(state);
         if (r.type === 'task_done' && current.id === r.taskId) {
           // Reattempt this even if state says done: a previous partial save may
@@ -149,11 +149,11 @@ const server = http.createServer((req, res) => {
         console.log('[bridge] receipt: ' + JSON.stringify({ type: r.type, taskId: r.taskId, ok: r.ok }));
         return json(res, 200, { ok: true });
       } catch (error) {
-        // Never acknowledge a receipt that could not be durably recorded.
+        // Never acknowledge a receipt after a failed filesystem write.
         console.error('[bridge] receipt persistence failed: ' + String(error?.code || error?.name || 'unknown'));
         return json(res, 503, { error: 'RECEIPT_PERSISTENCE_FAILED' });
       }
-    });;
+    });
     return;
   }
   return json(res, 404, { error: 'not found' });
