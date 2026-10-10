@@ -3,7 +3,8 @@
 // 与 ws 模式的区别：扩展主动轮询领任务，天然耐断连（server 重启/扩展休眠都不丢），
 // 适合无人值守批量任务 + 需要回执审计的场景。
 //
-// 幂等：lastTaskId 存 chrome.storage.local，SW 重启/重复领取都不会重跑同一任务。
+// 恢复语义：task_done 获得服务端成功回执后才记 lastTaskId；若中途断线可再次尝试。
+// 当前动作只支持 PING / OPEN_READ；未来若新增写操作，必须先设计服务端幂等键。
 // 首次使用：在扩展的 Service Worker 控制台执行
 //   chrome.storage.local.set({ bridgeToken: '<server 端 .bridge_token 文件内容>' })
 //
@@ -102,8 +103,7 @@ async function tick() {
     const task = await bridgeFetch("/task");
     if (!task || task.action === "NONE" || !task.id) return;
     const { lastTaskId } = await chrome.storage.local.get("lastTaskId");
-    if (lastTaskId === task.id) return; // 幂等：同一任务只跑一次
-    await chrome.storage.local.set({ lastTaskId: task.id });
+    if (lastTaskId === task.id) return; // 已确认结案的任务无需重复处理
 
     let ok = true, data = null, error = null;
     try {
@@ -121,6 +121,8 @@ async function tick() {
       method: "POST",
       body: JSON.stringify({ type: "task_done", taskId: task.id, ok }),
     });
+    // 只有服务端确认结案后才能持久标记；否则断线/休眠会令任务永久卡死。
+    await chrome.storage.local.set({ lastTaskId: task.id });
   } catch (e) {
     // server 未起/网络抖动：留给下一次轮询，不抛
   } finally {
