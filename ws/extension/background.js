@@ -107,11 +107,21 @@ async function handle(msg) {
     }
     case "scroll": {
       const tab = await getAllowedTab();
-      return run(tab.id, (dy) => { window.scrollBy({ top: dy, behavior: "smooth" }); return window.scrollY; }, [msg.dy || 800]);
+      return run(tab.id, (dy, hosts) => {
+        // This executes inside the document, closing the tabs.get → executeScript navigation race.
+        const h = location.hostname;
+        if (location.protocol !== "https:" || !hosts.some((d) => h === d || h.endsWith("." + d)))
+          throw new Error("page navigated outside ALLOWED_HOSTS");
+        window.scrollBy({ top: dy, behavior: "smooth" });
+        return window.scrollY;
+      }, [msg.dy || 800, ALLOWED_HOSTS]);
     }
     case "read": {
       const tab = await getAllowedTab();
-      return run(tab.id, (maxText) => {
+      return run(tab.id, (maxText, hosts) => {
+        const h = location.hostname;
+        if (location.protocol !== "https:" || !hosts.some((d) => h === d || h.endsWith("." + d)))
+          throw new Error("page navigated outside ALLOWED_HOSTS");
         const links = [];
         document.querySelectorAll("a[href]").forEach((a) => {
           const t = (a.innerText || "").replace(/\s+/g, " ").trim();
@@ -129,17 +139,20 @@ async function handle(msg) {
           links,
           imgs,
         };
-      }, [msg.maxText || 60000]);
+      }, [msg.maxText || 60000, ALLOWED_HOSTS]);
     }
     case "click": {
       if (!allowWrite) throw new Error("write actions disabled (allowWrite=false)");
       const tab = await getAllowedTab();
-      return run(tab.id, (sel) => {
+      return run(tab.id, (sel, hosts) => {
+        const h = location.hostname;
+        if (location.protocol !== "https:" || !hosts.some((d) => h === d || h.endsWith("." + d)))
+          throw new Error("page navigated outside ALLOWED_HOSTS");
         const el = document.querySelector(sel);
         if (!el) return { clicked: false, reason: "not found" };
         el.click();
         return { clicked: true, tag: el.tagName, text: (el.innerText || "").slice(0, 80) };
-      }, [msg.selector]);
+      }, [msg.selector, ALLOWED_HOSTS]);
     }
     default:
       throw new Error("unknown cmd: " + msg.cmd);
