@@ -69,12 +69,18 @@ async function handleAction(task) {
       if (!hostAllowed(current.url || "")) throw new Error("bridge tab redirected outside ALLOWED_HOSTS");
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: (maxText) => ({
-          url: location.href,
-          title: document.title,
-          text: (document.body ? document.body.innerText : "").slice(0, maxText),
-        }),
-        args: [task.maxText || 20000],
+        func: (maxText, hosts) => {
+          // Validate in the actual document, not just tabs.get: redirects can race script injection.
+          const h = location.hostname;
+          if (location.protocol !== "https:" || !hosts.some((d) => h === d || h.endsWith("." + d)))
+            throw new Error("page navigated outside ALLOWED_HOSTS");
+          return {
+            url: location.href,
+            title: document.title,
+            text: (document.body ? document.body.innerText : "").slice(0, maxText),
+          };
+        },
+        args: [task.maxText || 20000, ALLOWED_HOSTS],
       });
       return res ? res.result : null;
     }
