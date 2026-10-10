@@ -54,11 +54,18 @@ function readTask() {
 }
 
 function readState() {
-  try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch { return { doneTaskIds: [], results: [] }; }
+  if (!existsSync(STATE_FILE)) return { doneTaskIds: [], results: [] };
+  // Never silently treat an unreadable or corrupt prior state as empty: that loses idempotency evidence.
+  const state = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+  if (!state || !Array.isArray(state.doneTaskIds) || !Array.isArray(state.results)) {
+    throw new Error('invalid state file');
+  }
+  return state;
 }
 
 function writeState(s) {
-  try { writeFileSync(STATE_FILE, JSON.stringify(s, null, 1)); } catch {}
+  // A successful /result must mean the completion state was really saved.
+  writeFileSync(STATE_FILE, JSON.stringify(s, null, 1));
 }
 
 function json(res, code, obj) {
@@ -104,30 +111,49 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       let r;
       try { r = JSON.parse(d); } catch { return json(res, 400, { error: 'bad json' }); }
-      if (!r || typeof r !== 'object' || !r.taskId) return json(res, 400, { error: 'bad receipt' });
-      const state = readState();
-      const current = readTask();
-      // 回执必须对应当前任务；task_done 允许在 done 之后重复到达（等幂）
-      const isDone = state.doneTaskIds.includes(r.taskId);
-      if (current.id !== r.taskId && !isDone) {
-        return json(res, 409, { error: 'RECEIPT_TASK_MISMATCH' });
+      if (!r || typeof r !== 'object' || Array.isArray(r) || typeof r.taskId !== 'string' || !r.taskId) {
+        return json(res, 400, { error: 'bad receipt' });
       }
-      appendFileSync(RECEIPTS_FILE, JSON.stringify({ ...r, receivedAt: new Date().toISOString() }) + '\n');
-      state.results.push({ time: new Date().toISOString(), ...r });
-      if (state.results.length > 50) state.results = state.results.slice(-50);
-      if (r.type === 'task_done' && !isDone) {
-        state.doneTaskIds.push(r.taskId);
-        if (state.doneTaskIds.length > 200) state.doneTaskIds = state.doneTaskIds.slice(-200);
-        // 当前任务文件若匹配，也标 done（server 唯一写 task.json 的场景，语义是"结案"）
-        try {
-          const t = JSON.parse(readFileSync(TASK_FILE, 'utf8'));
-          if (t && t.id === r.taskId) writeFileSync(TASK_FILE, JSON.stringify({ ...t, done: true }, null, 1));
-        } catch {}
+      if (!['job_result', 'task_done'].includes(r.type)) {
+        return json(res, 400, { error: 'bad receipt type' });
       }
-      writeState(state);
-      console.log('[bridge] receipt: ' + JSON.stringify({ type: r.type, taskId: r.taskId, ok: r.ok }));
-      return json(res, 200, { ok: true });
-    });
+      try {
+        const state = readState();
+        const current = readTask();
+        // Only current or previously completed task IDs may report results.
+        const isDone = state.doneTaskIds.includes(r.taskId);
+        if (current.id !== r.taskId && !isDone) {
+          return json(res, 409, { error: 'RECEIPT_TASK_MISMATCH' });
+        }
+        appendFileSync(RECEIPTS_FILE, JSON.stringify({ ...r, receivedAt: new Date().toISOString() }) + '\n');
+        state.results.push({ time: new Date().toISOString(), ...r });
+        if (state.results.length > 50) state.results = state.results.slice(-50);
+        if (r.type === 'task_done' && !isDone) {
+          state.doneTaskIds.push(r.taskId);
+          if (state.doneTaskIds.length > 200) state.doneTaskIds = state.doneTaskIds.slice(-200);
+        }
+        // Persist the state *before* completing task.json; on any failure the
+        // extension gets 503 and can retry without losing the pending task.
+        writeState(state);
+        if (r.type === 'task_done' && current.id === r.taskId) {
+          // Reattempt this even if state says done: a previous partial save may
+          // have failed after state.json was committed but before task.json.
+          const currentTask = JSON.parse(readFileSync(TASK_FILE, 'utf8'));
+          if (currentTask.id !== r.taskId) {
+            return json(res, 409, { error: 'RECEIPT_TASK_MISMATCH' });
+          }
+          if (currentTask.done !== true) {
+            writeFileSync(TASK_FILE, JSON.stringify({ ...currentTask, done: true }, null, 1));
+          }
+        }
+        console.log('[bridge] receipt: ' + JSON.stringify({ type: r.type, taskId: r.taskId, ok: r.ok }));
+        return json(res, 200, { ok: true });
+      } catch (error) {
+        // Never acknowledge a receipt that could not be durably recorded.
+        console.error('[bridge] receipt persistence failed: ' + String(error?.code || error?.name || 'unknown'));
+        return json(res, 503, { error: 'RECEIPT_PERSISTENCE_FAILED' });
+      }
+    });;
     return;
   }
   return json(res, 404, { error: 'not found' });
