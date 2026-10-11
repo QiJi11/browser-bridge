@@ -2,7 +2,8 @@
 // Playwright context.route fulfills example.com locally with synthetic HTML.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, execFileSync, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { existsSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +13,7 @@ import { chromium } from 'playwright';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const fixtureText = 'Bridge isolated Chromium synthetic fixture 20261011';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const execAsync = promisify(execFile);
 
 async function until(fn, label, timeout = 18000) {
   const deadline = Date.now() + timeout;
@@ -138,26 +140,28 @@ test('real MV3 WebSocket extension connects and reads synthetic webpage', { time
     };
     server = startServer('python', ['ws/server.py'], env);
     await until(() => existsSync(env.BRIDGE_TOKEN_FILE), 'WS token creation');
-    const callCtl = (...args) => {
-      const stdout = execFileSync('python', ['ws/ctl.py', ...args], {
+    // Use async child I/O: blocking the Node event loop would stop Playwright's
+    // route.fulfill callback and make Chromium navigation appear to time out.
+    const callCtl = async (...args) => {
+      const { stdout } = await execAsync('python', ['ws/ctl.py', ...args], {
         cwd: ROOT, env: { ...process.env, ...env }, encoding: 'utf8', timeout: 18000,
       });
       return stdout.trim();
     };
     await browser.worker.evaluate(() => connect());
     await until(() => {
-      const response = JSON.parse(callCtl('status'));
+      const response = JSON.parse(await callCtl('status'));
       return response.ok ? response : null;
     }, 'real MV3 WebSocket extension connection', 30000);
-    const opened = JSON.parse(callCtl('open', 'https://example.com/'));
+    const opened = JSON.parse(await callCtl('open', 'https://example.com/'));
     assert.equal(opened.ok, true, opened.error || 'open failed');
     assert.equal(opened.data.url, 'https://example.com/');
     const file = join(dataDir, 'result.json');
-    const output = callCtl('read', file, '6000');
+    const output = await callCtl('read', file, '6000');
     assert.match(output, /^ok /);
     const content = JSON.parse(readFileSync(file, 'utf8'));
     assert.match(content.text, /Bridge isolated Chromium synthetic fixture/);
-    const blocked = JSON.parse(callCtl('open', 'https://blocked.invalid/'));
+    const blocked = JSON.parse(await callCtl('open', 'https://blocked.invalid/'));
     assert.equal(blocked.ok, false);
     assert.match(blocked.error, /ALLOWED_HOSTS/);
   } finally {
