@@ -1,10 +1,11 @@
 // Real Chromium MV3 E2E in a disposable profile. No user login, cookies or remote websites.
-// Playwright context.route fulfills example.com locally with synthetic HTML.
+// A temporary HTTPS server on 127.0.0.1 supplies all test pages, never public example.com.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { existsSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, cpSync } from 'node:fs';
+import { createServer as createHttpsServer } from 'node:https';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -28,28 +29,61 @@ async function until(fn, label, timeout = 18000) {
   throw new Error('Timed out waiting for ' + label + (last ? ': ' + String(last) : ''));
 }
 
-async function extensionContext(mode) {
-  const extensionPath = join(ROOT, mode, 'extension');
+async function startLocalHttpsFixture(dir) {
+  const keyFile = join(dir, 'fixture.key');
+  const certFile = join(dir, 'fixture.crt');
+  execFileSync('openssl', [
+    'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+    '-keyout', keyFile, '-out', certFile, '-days', '1',
+    '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
+  ], { stdio: 'ignore', timeout: 12000 });
+  const server = createHttpsServer({
+    key: readFileSync(keyFile), cert: readFileSync(certFile),
+  }, (_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    response.end('<!doctype html><html><head><title>Bridge fixture</title></head><body>' +
+      fixtureText + '</body></html>');
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  return {
+    url: 'https://127.0.0.1:' + server.address().port + '/',
+    close: async () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+async function extensionContext(mode, dir) {
+  // Load an isolated copy: production example.com permissions are replaced with
+  // loopback-only HTTPS permissions for this test, without changing shipped code.
+  const extensionPath = join(dir, mode + '-extension');
+  cpSync(join(ROOT, mode, 'extension'), extensionPath, { recursive: true });
+  const script = join(extensionPath, 'background.js');
+  const original = readFileSync(script, 'utf8');
+  assert.match(original, /"example.com"/, 'expected fixture host in extension allowlist');
+  writeFileSync(script, original.replace('"example.com"', '"127.0.0.1"'));
+  const manifestPath = join(extensionPath, 'manifest.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  manifest.host_permissions = manifest.host_permissions.filter((p) => p.includes('127.0.0.1'));
+  manifest.host_permissions.push('https://127.0.0.1/*');
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
   // Empty profile location asks Playwright to make and clean a fresh temporary profile.
   const context = await chromium.launchPersistentContext('', {
     channel: 'chromium',
     headless: true,
     serviceWorkers: 'allow',
+    ignoreHTTPSErrors: true,
     args: [
       '--disable-extensions-except=' + extensionPath,
       '--load-extension=' + extensionPath,
+      '--allow-insecure-localhost',
     ],
   });
-  // Prevent external requests, including those from a future regression.
+  // No remote site is needed: allow only the local fixture and bridge ports.
   await context.route('**/*', (route) => {
     const url = new URL(route.request().url());
-    if (url.hostname === 'example.com' && url.protocol === 'https:') {
-      return route.fulfill({
-        status: 200,
-        contentType: 'text/html; charset=utf-8',
-        body: '<!doctype html><html><head><title>Bridge fixture</title></head><body>' + fixtureText + '</body></html>',
-      });
-    }
     if (url.hostname === '127.0.0.1' || url.hostname === 'localhost') return route.continue();
     return route.abort('blockedbyclient');
   });
@@ -80,9 +114,10 @@ async function stopServer(proc) {
 
 test('real MV3 poll extension reads synthetic page through localhost task bridge', { timeout: 100000 }, async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'bridge-chromium-poll-'));
-  let browser, server;
+  let browser, server, site;
   try {
-    browser = await extensionContext('poll');
+    site = await startLocalHttpsFixture(dataDir);
+    browser = await extensionContext('poll', dataDir);
     const env = {
       BRIDGE_DATA_DIR: dataDir,
       BRIDGE_EXTENSION_ORIGIN: 'chrome-extension://' + browser.extensionId,
@@ -97,7 +132,7 @@ test('real MV3 poll extension reads synthetic page through localhost task bridge
     }, 'poll health');
     // Browser worker receives the synthetic control token only inside this disposable context.
     await browser.worker.evaluate(async (t) => chrome.storage.local.set({ bridgeToken: t }), token);
-    execFileSync(process.execPath, ['poll/ctl.mjs', 'task', 'OPEN_READ', JSON.stringify({ url: 'https://example.com/' })], {
+    execFileSync(process.execPath, ['poll/ctl.mjs', 'task', 'OPEN_READ', JSON.stringify({ url: site.url })], {
       cwd: ROOT, env: { ...process.env, ...env }, timeout: 5000,
     });
     await browser.worker.evaluate(async () => { await tick(); });
@@ -110,7 +145,7 @@ test('real MV3 poll extension reads synthetic page through localhost task bridge
     const job = receipts.find((r) => r.type === 'job_result');
     assert.equal(job.ok, true, 'actual browser page read failed: ' + JSON.stringify(job.error));
     assert.match(job.data.text, /Bridge isolated Chromium synthetic fixture/);
-    assert.equal(job.data.url, 'https://example.com/');
+    assert.equal(job.data.url, site.url);
     const done = JSON.parse(readFileSync(join(dataDir, 'task.json'), 'utf8'));
     assert.equal(done.done, true);
     // A forbidden host must not get loaded into the browser, even with the correct bridge token.
@@ -123,15 +158,17 @@ test('real MV3 poll extension reads synthetic page through localhost task bridge
   } finally {
     await browser?.context.close();
     await stopServer(server);
+    await site?.close();
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
 
 test('real MV3 WebSocket extension connects and reads synthetic webpage', { timeout: 100000 }, async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'bridge-chromium-ws-'));
-  let browser, server;
+  let browser, server, site;
   try {
-    browser = await extensionContext('ws');
+    site = await startLocalHttpsFixture(dataDir);
+    browser = await extensionContext('ws', dataDir);
     const env = {
       BRIDGE_TOKEN_FILE: join(dataDir, 'ws.token'),
       BRIDGE_EXTENSION_ORIGIN: 'chrome-extension://' + browser.extensionId,
@@ -153,9 +190,9 @@ test('real MV3 WebSocket extension connects and reads synthetic webpage', { time
       const response = JSON.parse(await callCtl('status'));
       return response.ok ? response : null;
     }, 'real MV3 WebSocket extension connection', 30000);
-    const opened = JSON.parse(await callCtl('open', 'https://example.com/'));
+    const opened = JSON.parse(await callCtl('open', site.url));
     assert.equal(opened.ok, true, opened.error || 'open failed');
-    assert.equal(opened.data.url, 'https://example.com/');
+    assert.equal(opened.data.url, site.url);
     const file = join(dataDir, 'result.json');
     const output = await callCtl('read', file, '6000');
     assert.match(output, /^ok /);
@@ -167,6 +204,7 @@ test('real MV3 WebSocket extension connects and reads synthetic webpage', { time
   } finally {
     await browser?.context.close();
     await stopServer(server);
+    await site?.close();
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
