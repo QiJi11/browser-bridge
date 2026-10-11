@@ -149,7 +149,7 @@ test('real MV3 WebSocket extension connects and reads synthetic webpage', { time
       return stdout.trim();
     };
     await browser.worker.evaluate(() => connect());
-    await until(() => {
+    await until(async () => {
       const response = JSON.parse(await callCtl('status'));
       return response.ok ? response : null;
     }, 'real MV3 WebSocket extension connection', 30000);
