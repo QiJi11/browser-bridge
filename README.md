@@ -123,6 +123,7 @@ poll/                 拉模式（HTTP 轮询，任务单 + 回执）
   extension/          MV3 扩展：轮询领任务、taskId 幂等、串行执行
 docs/
   security.md         威胁模型与防护
+  operations.md       多实例部署 / 回执纪律 / 已知故障（实测）
   landscape.md        生态与关键词调研
 tests/
   test_ws_server.py   端到端测试（正向 + 反向），pytest
@@ -157,6 +158,20 @@ node --test tests/test_poll_server.mjs          # poll：8 用例（含 5 个反
    `fetch` 被拦（报 "Failed to fetch"，且失败会被 catch 吞掉、表现为"任务没反应"）。
    manifest 已内置；若改端口或改走 https 本地服务，记得同步改 host_permissions。
    （ws 模式的 WebSocket 连接不受此限制，实测无需声明。）
+
+## 运维与已知故障（实测）
+
+长期跑在真实账号上才暴露的问题，完整版见 [docs/operations.md](docs/operations.md)：
+
+- **多实例**：一个账号一个实例，`BRIDGE_PORT` + `BRIDGE_DATA_DIR` 必须成对隔离；
+  扩展里的桥地址是硬编码常量，改端口要改扩展并重新加载。
+- **回执纪律**：`job_result` 只说明动作有结果，**`task_done` 才是结案**；计数/去重只看 `task_done`，
+  `receipts.jsonl` 是唯一可信审计流水（HTTP 200 不代表落盘）。
+- **最贵的故障是静默挂起**：SW 内 `await` 的 Promise 永不 resolve 时，不开 tab、不抛错、不发回执，
+  服务端只看到"任务没反应"。所以动作要带超时、错误路径也必须发回执。
+- **状态串号**：就绪/忙状态按 `tabId` 记，别用全局集合，否则换页后残留的 `CS_READY` 会把后续动作判成
+  `READONLY_EXTENSION_BUSY`。
+- **别开免鉴权旁路**：任何一个不校验 token 的调试端点（RESET/COLLECT/EVAL 之类）都会击穿整个 token 边界。
 
 ## 来源
 
