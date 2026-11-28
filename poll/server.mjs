@@ -15,7 +15,7 @@
 // 幂等由扩展侧 taskId 去重保证（SW 重启不会重跑同一任务）。
 //
 // 环境变量：BRIDGE_PORT(17777) / BRIDGE_DATA_DIR / BRIDGE_SELF_EXIT_MS（测试自退）
-//          BRIDGE_EXTENSION_ORIGIN（可选，精确锁死你的扩展 ID，如 chrome-extension://abcd...）
+//          BRIDGE_EXTENSION_ORIGIN（必填，精确绑定 chrome-extension://<32 位扩展 ID>）
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
@@ -29,7 +29,11 @@ const TOKEN_FILE = join(DATA_DIR, '.bridge_token');
 const TASK_FILE = join(DATA_DIR, 'task.json');
 const STATE_FILE = join(DATA_DIR, 'state.json');
 const RECEIPTS_FILE = join(DATA_DIR, 'receipts.jsonl');
-const LOCKED_ORIGIN = process.env.BRIDGE_EXTENSION_ORIGIN || null; // 可选：精确扩展 ID
+const LOCKED_ORIGIN = (process.env.BRIDGE_EXTENSION_ORIGIN || '').trim();
+if (!/^chrome-extension:\/\/[a-p]{32}$/.test(LOCKED_ORIGIN)) {
+  console.error('[bridge] BRIDGE_EXTENSION_ORIGIN must be the exact chrome-extension://<32-letter-extension-id>');
+  process.exit(2);
+}
 
 // token 持久化：重启 server 不失效（扩展侧只配置一次）
 let TOKEN;
@@ -37,24 +41,39 @@ if (existsSync(TOKEN_FILE)) {
   TOKEN = readFileSync(TOKEN_FILE, 'utf8').trim();
 } else {
   TOKEN = crypto.randomBytes(24).toString('base64url');
-  writeFileSync(TOKEN_FILE, TOKEN);
+  writeFileSync(TOKEN_FILE, TOKEN, { mode: 0o600, flag: "wx" });
   console.log('[bridge] generated new token -> ' + TOKEN_FILE);
+}
+// An empty or predictably short token must not turn localhost into an unauthenticated API.
+if (!/^[A-Za-z0-9_-]{32,128}$/.test(TOKEN)) {
+  console.error('[bridge] invalid bridge token file; stop and rotate it offline');
+  process.exit(2);
 }
 
 function readTask() {
-  try {
-    const t = JSON.parse(readFileSync(TASK_FILE, 'utf8'));
-    if (t && t.action && t.done !== true) return t;
-  } catch {}
-  return { action: 'NONE' };
+  if (!existsSync(TASK_FILE)) return { action: 'NONE' };
+  const t = JSON.parse(readFileSync(TASK_FILE, 'utf8'));
+  if (!t || typeof t !== 'object' || Array.isArray(t) || typeof t.action !== 'string') {
+    throw new Error('invalid task file');
+  }
+  if (t.action === 'NONE' || t.done === true) return { action: 'NONE' };
+  if (typeof t.id !== 'string' || !t.id) throw new Error('invalid active task id');
+  return t;
 }
 
 function readState() {
-  try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch { return { doneTaskIds: [], results: [] }; }
+  if (!existsSync(STATE_FILE)) return { doneTaskIds: [], results: [] };
+  // Never silently treat an unreadable or corrupt prior state as empty: that loses idempotency evidence.
+  const state = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+  if (!state || !Array.isArray(state.doneTaskIds) || !Array.isArray(state.results)) {
+    throw new Error('invalid state file');
+  }
+  return state;
 }
 
 function writeState(s) {
-  try { writeFileSync(STATE_FILE, JSON.stringify(s, null, 1)); } catch {}
+  // A successful /result means its completion state write succeeded (not a power-loss fsync guarantee).
+  writeFileSync(STATE_FILE, JSON.stringify(s, null, 1));
 }
 
 function json(res, code, obj) {
@@ -65,8 +84,7 @@ function json(res, code, obj) {
 function originOk(req) {
   const origin = req.headers.origin || '';
   if (!origin) return true; // curl / 本机脚本不带 Origin
-  if (LOCKED_ORIGIN) return origin === LOCKED_ORIGIN;
-  return origin.startsWith('chrome-extension://');
+  return origin === LOCKED_ORIGIN;
 }
 
 const server = http.createServer((req, res) => {
@@ -86,14 +104,19 @@ const server = http.createServer((req, res) => {
   }
   if (!originOk(req)) return json(res, 403, { error: 'bad origin' });
 
-  const auth = req.headers['x-bridge-token'] === TOKEN || u.searchParams.get('token') === TOKEN;
+  const auth = req.headers['x-bridge-token'] === TOKEN;
   if (!auth) return json(res, 403, { error: 'bad token' });
 
   if (req.method === 'GET' && u.pathname === '/health') {
     return json(res, 200, { ok: true, port: PORT, dataDir: DATA_DIR });
   }
   if (req.method === 'GET' && u.pathname === '/task') {
-    return json(res, 200, readTask());
+    try {
+      return json(res, 200, readTask());
+    } catch (error) {
+      console.error('[bridge] task file unavailable: ' + String(error?.code || error?.name || 'invalid'));
+      return json(res, 503, { error: 'TASK_STATE_UNAVAILABLE' });
+    }
   }
   if (req.method === 'POST' && u.pathname === '/result') {
     let d = '';
@@ -101,29 +124,48 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       let r;
       try { r = JSON.parse(d); } catch { return json(res, 400, { error: 'bad json' }); }
-      if (!r || typeof r !== 'object' || !r.taskId) return json(res, 400, { error: 'bad receipt' });
-      const state = readState();
-      const current = readTask();
-      // 回执必须对应当前任务；task_done 允许在 done 之后重复到达（等幂）
-      const isDone = state.doneTaskIds.includes(r.taskId);
-      if (current.id !== r.taskId && !isDone) {
-        return json(res, 409, { error: 'RECEIPT_TASK_MISMATCH' });
+      if (!r || typeof r !== 'object' || Array.isArray(r) || typeof r.taskId !== 'string' || !r.taskId) {
+        return json(res, 400, { error: 'bad receipt' });
       }
-      appendFileSync(RECEIPTS_FILE, JSON.stringify({ ...r, receivedAt: new Date().toISOString() }) + '\n');
-      state.results.push({ time: new Date().toISOString(), ...r });
-      if (state.results.length > 50) state.results = state.results.slice(-50);
-      if (r.type === 'task_done' && !isDone) {
-        state.doneTaskIds.push(r.taskId);
-        if (state.doneTaskIds.length > 200) state.doneTaskIds = state.doneTaskIds.slice(-200);
-        // 当前任务文件若匹配，也标 done（server 唯一写 task.json 的场景，语义是"结案"）
-        try {
-          const t = JSON.parse(readFileSync(TASK_FILE, 'utf8'));
-          if (t && t.id === r.taskId) writeFileSync(TASK_FILE, JSON.stringify({ ...t, done: true }, null, 1));
-        } catch {}
+      if (!['job_result', 'task_done'].includes(r.type)) {
+        return json(res, 400, { error: 'bad receipt type' });
       }
-      writeState(state);
-      console.log('[bridge] result: ' + JSON.stringify(r).slice(0, 400));
-      return json(res, 200, { ok: true });
+      try {
+        const state = readState();
+        const current = readTask();
+        // Only current or previously completed task IDs may report results.
+        const isDone = state.doneTaskIds.includes(r.taskId);
+        if (current.id !== r.taskId && !isDone) {
+          return json(res, 409, { error: 'RECEIPT_TASK_MISMATCH' });
+        }
+        appendFileSync(RECEIPTS_FILE, JSON.stringify({ ...r, receivedAt: new Date().toISOString() }) + '\n');
+        state.results.push({ time: new Date().toISOString(), ...r });
+        if (state.results.length > 50) state.results = state.results.slice(-50);
+        if (r.type === 'task_done' && !isDone) {
+          state.doneTaskIds.push(r.taskId);
+          if (state.doneTaskIds.length > 200) state.doneTaskIds = state.doneTaskIds.slice(-200);
+        }
+        // Write state *before* completing task.json; on any failure the
+        // extension gets 503 and can retry rather than silently losing pending work.
+        writeState(state);
+        if (r.type === 'task_done' && current.id === r.taskId) {
+          // Reattempt this even if state says done: a previous partial save may
+          // have failed after state.json was committed but before task.json.
+          const currentTask = JSON.parse(readFileSync(TASK_FILE, 'utf8'));
+          if (currentTask.id !== r.taskId) {
+            return json(res, 409, { error: 'RECEIPT_TASK_MISMATCH' });
+          }
+          if (currentTask.done !== true) {
+            writeFileSync(TASK_FILE, JSON.stringify({ ...currentTask, done: true }, null, 1));
+          }
+        }
+        console.log('[bridge] receipt: ' + JSON.stringify({ type: r.type, taskId: r.taskId, ok: r.ok }));
+        return json(res, 200, { ok: true });
+      } catch (error) {
+        // Never acknowledge a receipt after a failed filesystem write.
+        console.error('[bridge] receipt persistence failed: ' + String(error?.code || error?.name || 'unknown'));
+        return json(res, 503, { error: 'RECEIPT_PERSISTENCE_FAILED' });
+      }
     });
     return;
   }

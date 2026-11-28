@@ -20,7 +20,9 @@ let bridgeTabId = null;
 
 function hostAllowed(url) {
   try {
-    const h = new URL(url).hostname;
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return false;
+    const h = parsed.hostname;
     return ALLOWED_HOSTS.some((d) => h === d || h.endsWith("." + d));
   } catch {
     return false;
@@ -63,6 +65,12 @@ async function getTab() {
   return t;
 }
 
+async function getAllowedTab() {
+  const tab = await getTab();
+  if (!hostAllowed(tab.url || "")) throw new Error("bridge tab is outside ALLOWED_HOSTS");
+  return tab;
+}
+
 function waitComplete(tabId, timeoutMs = 45000) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(fn); resolve("timeout"); }, timeoutMs);
@@ -91,18 +99,31 @@ async function handle(msg) {
         throw new Error("host not in ALLOWED_HOSTS: " + msg.url);
       }
       const tab = await getTab();
+      // Register before navigating; a fast navigation may complete before tabs.update resolves.
+      const completed = waitComplete(tab.id);
       await chrome.tabs.update(tab.id, { url: msg.url, active: true });
-      const st = await waitComplete(tab.id);
+      const st = await completed;
       const t = await chrome.tabs.get(tab.id);
+      if (!hostAllowed(t.url || "")) throw new Error("bridge tab redirected outside ALLOWED_HOSTS");
       return { load: st, url: t.url, title: t.title };
     }
     case "scroll": {
-      const tab = await getTab();
-      return run(tab.id, (dy) => { window.scrollBy({ top: dy, behavior: "smooth" }); return window.scrollY; }, [msg.dy || 800]);
+      const tab = await getAllowedTab();
+      return run(tab.id, (dy, hosts) => {
+        // This executes inside the document, closing the tabs.get → executeScript navigation race.
+        const h = location.hostname;
+        if (location.protocol !== "https:" || !hosts.some((d) => h === d || h.endsWith("." + d)))
+          throw new Error("page navigated outside ALLOWED_HOSTS");
+        window.scrollBy({ top: dy, behavior: "smooth" });
+        return window.scrollY;
+      }, [msg.dy || 800, ALLOWED_HOSTS]);
     }
     case "read": {
-      const tab = await getTab();
-      return run(tab.id, (maxText) => {
+      const tab = await getAllowedTab();
+      return run(tab.id, (maxText, hosts) => {
+        const h = location.hostname;
+        if (location.protocol !== "https:" || !hosts.some((d) => h === d || h.endsWith("." + d)))
+          throw new Error("page navigated outside ALLOWED_HOSTS");
         const links = [];
         document.querySelectorAll("a[href]").forEach((a) => {
           const t = (a.innerText || "").replace(/\s+/g, " ").trim();
@@ -120,17 +141,20 @@ async function handle(msg) {
           links,
           imgs,
         };
-      }, [msg.maxText || 60000]);
+      }, [msg.maxText || 60000, ALLOWED_HOSTS]);
     }
     case "click": {
       if (!allowWrite) throw new Error("write actions disabled (allowWrite=false)");
-      const tab = await getTab();
-      return run(tab.id, (sel) => {
+      const tab = await getAllowedTab();
+      return run(tab.id, (sel, hosts) => {
+        const h = location.hostname;
+        if (location.protocol !== "https:" || !hosts.some((d) => h === d || h.endsWith("." + d)))
+          throw new Error("page navigated outside ALLOWED_HOSTS");
         const el = document.querySelector(sel);
         if (!el) return { clicked: false, reason: "not found" };
         el.click();
         return { clicked: true, tag: el.tagName, text: (el.innerText || "").slice(0, 80) };
-      }, [msg.selector]);
+      }, [msg.selector, ALLOWED_HOSTS]);
     }
     default:
       throw new Error("unknown cmd: " + msg.cmd);

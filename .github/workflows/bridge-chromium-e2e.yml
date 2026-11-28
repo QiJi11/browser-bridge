@@ -1,0 +1,42 @@
+name: Bridge Chromium MV3 end-to-end
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ws/**'
+      - 'poll/**'
+      - 'tests/test_chromium_e2e.mjs'
+      - '.github/workflows/bridge-chromium-e2e.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  chromium-mv3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test-only browser and Python dependencies
+        run: |
+          npm init -y >/dev/null
+          npm install --no-save --ignore-scripts --no-package-lock playwright@1.64.0
+          python -m pip install "websockets>=14,<16" "websocket-client>=1,<2"
+          npx playwright install --with-deps --no-shell chromium
+      - name: Check isolated E2E test source
+        run: node --check tests/test_chromium_e2e.mjs
+      - name: Run real Chromium MV3 with synthetic page and local bridge only
+        env:
+          CI: 'true'
+        run: node --test tests/test_chromium_e2e.mjs

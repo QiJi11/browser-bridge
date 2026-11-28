@@ -1,0 +1,43 @@
+name: Bridge isolated regression
+
+on:
+  pull_request:
+    branches:
+      - main
+
+# Cancel superseded PR runs to avoid burning private Actions minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  websocket:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test-only dependencies
+        run: python -m pip install "pytest>=8,<10" "websockets>=14,<16"
+      - name: WebSocket tests (simulated extensions only)
+        run: python -m pytest tests/test_ws_server.py -q
+
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Node HTTP polling, simulated MV3 recovery, CLI and injected-origin checks
+        run: node --test tests/test_poll_server.mjs tests/test_poll_extension.mjs tests/test_poll_cli.mjs tests/test_injected_origin_guard.mjs tests/test_poll_startup.mjs
+      - name: Validate extension scripts
+        run: |
+          node --check ws/extension/background.js
+          node --check poll/extension/background.js

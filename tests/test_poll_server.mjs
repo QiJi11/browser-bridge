@@ -9,7 +9,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -18,8 +18,10 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 28777; // 避开默认 17777
 const DATA_DIR = mkdtempSync(join(tmpdir(), 'pollbridge-'));
 const TASK_FILE = join(DATA_DIR, 'task.json');
+const STATE_FILE = join(DATA_DIR, 'state.json');
 const RECEIPTS_FILE = join(DATA_DIR, 'receipts.jsonl');
 const TOKEN_FILE = join(DATA_DIR, '.bridge_token');
+const EXT_ORIGIN = 'chrome-extension://' + 'a'.repeat(32);
 
 let proc;
 let TOKEN;
@@ -47,7 +49,7 @@ function req(method, path, { token, origin, body } = {}) {
 
 before(async () => {
   proc = spawn(process.execPath, [join(ROOT, 'poll', 'server.mjs')], {
-    env: { ...process.env, BRIDGE_PORT: String(PORT), BRIDGE_DATA_DIR: DATA_DIR },
+    env: { ...process.env, BRIDGE_PORT: String(PORT), BRIDGE_DATA_DIR: DATA_DIR, BRIDGE_EXTENSION_ORIGIN: EXT_ORIGIN },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   proc.stdout.on('data', () => {});
@@ -97,10 +99,24 @@ test('rejects web-page origin on preflight', async () => {
   assert.equal(r.status, 403);
 });
 
-test('allows extension origin on preflight', async () => {
-  const origin = 'chrome-extension://' + 'a'.repeat(32);
-  const r = await req('OPTIONS', '/health', { origin });
+test('allows exact configured extension origin on preflight', async () => {
+  const r = await req('OPTIONS', '/health', { origin: EXT_ORIGIN });
   assert.equal(r.status, 204);
+});
+
+test('rejects other extension Origin despite chrome-extension scheme', async () => {
+  const r = await req('OPTIONS', '/health', { origin: 'chrome-extension://' + 'b'.repeat(32) });
+  assert.equal(r.status, 403);
+});
+
+test('rejects token in URL query even if otherwise valid', async () => {
+  const r = await req('GET', '/health?token=' + encodeURIComponent(TOKEN));
+  assert.equal(r.status, 403);
+});
+
+test('accepts local CLI with token header', async () => {
+  const r = await req('GET', '/health', { token: TOKEN });
+  assert.equal(r.status, 200);
 });
 
 // ── 正向用例 ──────────────────────────────────────────────
@@ -141,4 +157,69 @@ test('health reports ok', async () => {
   const r = await req('GET', '/health', { token: TOKEN });
   assert.equal(r.status, 200);
   assert.equal(r.body.ok, true);
+});
+
+
+test('bad receipt type must not be acknowledged', async () => {
+  writeFileSync(TASK_FILE, JSON.stringify({ id: 'task-bad-type', action: 'PING', done: false }));
+  const res = await req('POST', '/result', {
+    token: TOKEN, body: { type: 'unexpected', taskId: 'task-bad-type' },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'bad receipt type');
+  assert.equal(JSON.parse(readFileSync(TASK_FILE, 'utf8')).done, false);
+});
+
+test('unwritable state must return 503 without marking task complete', async (t) => {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    t.skip('root bypasses normal filesystem permissions');
+    return;
+  }
+  writeFileSync(TASK_FILE, JSON.stringify({ id: 'task-state-denied', action: 'PING', done: false }));
+  assert.ok(existsSync(STATE_FILE), 'previous tests must have generated state.json');
+  chmodSync(STATE_FILE, 0o400);
+  try {
+    const denied = await req('POST', '/result', {
+      token: TOKEN, body: { type: 'task_done', taskId: 'task-state-denied', ok: true },
+    });
+    assert.equal(denied.status, 503);
+    assert.equal(denied.body.error, 'RECEIPT_PERSISTENCE_FAILED');
+    assert.equal(JSON.parse(readFileSync(TASK_FILE, 'utf8')).done, false);
+  } finally {
+    chmodSync(STATE_FILE, 0o600);
+  }
+  const retried = await req('POST', '/result', {
+    token: TOKEN, body: { type: 'task_done', taskId: 'task-state-denied', ok: true },
+  });
+  assert.equal(retried.status, 200);
+  assert.equal(JSON.parse(readFileSync(TASK_FILE, 'utf8')).done, true);
+});
+
+test('malformed existing state must not silently reset idempotency history', async () => {
+  const saved = readFileSync(STATE_FILE, 'utf8');
+  writeFileSync(STATE_FILE, '{invalid json');
+  writeFileSync(TASK_FILE, JSON.stringify({ id: 'task-corrupt-state', action: 'PING', done: false }));
+  try {
+    const result = await req('POST', '/result', {
+      token: TOKEN, body: { type: 'task_done', taskId: 'task-corrupt-state' },
+    });
+    assert.equal(result.status, 503);
+    assert.equal(JSON.parse(readFileSync(TASK_FILE, 'utf8')).done, false);
+    assert.equal(readFileSync(STATE_FILE, 'utf8'), '{invalid json');
+  } finally {
+    writeFileSync(STATE_FILE, saved);
+  }
+});
+
+test('corrupt pending task returns 503 instead of a misleading empty queue', async () => {
+  const saved = readFileSync(TASK_FILE, 'utf8');
+  writeFileSync(TASK_FILE, '{truncated-task');
+  try {
+    const r = await req('GET', '/task', { token: TOKEN });
+    assert.equal(r.status, 503);
+    assert.equal(r.body.error, 'TASK_STATE_UNAVAILABLE');
+    assert.equal(readFileSync(TASK_FILE, 'utf8'), '{truncated-task');
+  } finally {
+    writeFileSync(TASK_FILE, saved);
+  }
 });

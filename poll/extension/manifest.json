@@ -3,7 +3,18 @@
   "name": "Local Poll Bridge",
   "version": "0.1.0",
   "description": "本机 http://127.0.0.1:17777 任务桥的浏览器端：轮询领任务、在真实登录态浏览器里执行、回报执。不申请 debugger 权限。",
-  "permissions": ["tabs", "scripting", "alarms", "storage"],
-  "host_permissions": ["https://*/*", "http://127.0.0.1/*", "http://localhost/*"],
-  "background": { "service_worker": "background.js" }
+  "permissions": [
+    "tabs",
+    "scripting",
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://example.com/*",
+    "https://*.example.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
 }

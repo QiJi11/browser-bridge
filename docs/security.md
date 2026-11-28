@@ -22,16 +22,15 @@
 | 只绑 127.0.0.1 | `ws/server.py`、`poll/server.mjs` | 不对局域网/外网开放 |
 | `/ctl` 拒绝带 Origin 的连接 | `ws/server.py` | 网页发起的 WebSocket **一定**带 Origin；本机进程不带 |
 | `/ctl` 随机 token | `ws/server.py` | 启动生成、只写本机文件；`hmac.compare_digest` 比较 |
-| `/ext` 只收 `chrome-extension://` Origin | `ws/server.py` | 网页 Origin 是 http(s):// |
-| poll 侧 token（持久化） | `poll/server.mjs` | header `x-bridge-token` 或 query |
-| poll CORS 只回显扩展 Origin | `poll/server.mjs` | 可选 `BRIDGE_EXTENSION_ORIGIN` 精确锁扩展 ID |
-| 站点白名单 | 扩展 `ALLOWED_HOSTS` | 打开新页面的硬闸，默认近乎为空（fail-closed） |
+| `/ext` 精确匹配扩展 Origin | `ws/server.py` | 必填 `BRIDGE_EXTENSION_ORIGIN`，与唯一扩展 ID 一致，否则拒绝启动；拒绝另一个同时连接的扩展 |
+| poll 侧 token（持久化） | `poll/server.mjs` | 仅 `x-bridge-token` header，拒绝 URL 查询参数凭据 |
+| poll CORS 精确绑定 Origin | `poll/server.mjs` | 必填 `BRIDGE_EXTENSION_ORIGIN`，拒绝其他扩展 Origin；本地 CLI 无 Origin 仍需 token |
+| 双重站点白名单 | 扩展 `ALLOWED_HOSTS` + manifest `host_permissions` | 默认只允许示例 HTTPS 站点；读、滚动、点击与最终跳转 URL 均检查 |
 | 写操作默认关 | 扩展 `allowWrite` | click 类动作需显式打开 |
 
 **已知残余风险**：
-- 恶意**扩展**（而非网页）可以连 `/ext`。多扩展共存的浏览器里，白名单机制管不住这个；
-  如需要，把 `/ext` 的校验从"前缀 chrome-extension://"升级为"精确等于你的扩展 ID"（一行改动）。
-- WS 模式的 token 每次重启轮换，控制端需重读文件；poll 模式 token 持久化，泄露后要手动删除 `.bridge_token` 轮换。
+- 现在会拒绝其他**浏览器扩展**的 Origin；但**本机进程**可以伪造 Origin，精确 Origin 校验不等于端到端鉴权。仍须信任本机进程和用户目录 ACL。
+- WS 模式的控制端 token 每次重启轮换，控制端需重读文件；poll 模式 token 持久化，泄露后需停服务、删掉 `.bridge_token` 并更新扩展 storage 中的 token。避免在 URL 传 token。
 
 ## 2. 桥被滥用（拿到桥 = 拿到你的浏览器）
 
@@ -58,7 +57,8 @@
 ## 检查单（部署前过一遍）
 
 - [ ] server 只监听 `127.0.0.1`（默认满足）
-- [ ] `ALLOWED_HOSTS` 只填必要域名（默认近乎为空）
+- [ ] `BRIDGE_EXTENSION_ORIGIN` 设为真实扩展的准确 ID（必需）；其他扩展连接被拒
+- [ ] `ALLOWED_HOSTS` 和 manifest `host_permissions` 仅包含实际 HTTPS 域名，扩展重新加载
 - [ ] `allowWrite` 保持 `false`，除非确实要点击类操作
 - [ ] 不要把端口、token 暴露到任何公网/共享环境
 - [ ] 浏览器是用户自己的日常浏览器 / 或专用 profile，不用来登录不该被驱动的账号

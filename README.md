@@ -21,8 +21,8 @@
 |---|---|---|
 | 通道 | WebSocket 长连接 | HTTP 轮询（chrome.alarms） |
 | 延迟 | 低，实时 | 一个轮询周期（≥30s） |
-| 断连恢复 | 自动重连 | 天然耐断，server 重启不丢任务 |
-| 任务语义 | 无状态转发（一问一答） | 任务单 + 回执流水 + taskId 幂等 |
+| 断连恢复 | 自动重连 | 任务文件持久化，失败可重试；只读动作可能重复执行 |
+| 任务语义 | 无状态转发（一问一答） | 单任务槽位 + 回执流水 + 成功确认后标记完成（非 exactly-once） |
 | 适合 | 交互式读取、爬取、调试 | 无人值守批量任务、要审计的场景 |
 
 选型一句话：**要实时互动用 `ws/`，要"发单-执行-留痕"用 `poll/`。**
@@ -33,12 +33,20 @@
 
 ```bash
 pip install websockets websocket-client
-python ws/server.py                     # 监听 127.0.0.1:18786，token 写入 ws/.bridge_token
 ```
 
-1. Chrome → `chrome://extensions` → 开发者模式 → 「加载已解压的扩展程序」→ 选 `ws/extension/`
-2. 编辑 `ws/extension/background.js` 顶部的 `ALLOWED_HOSTS`，填你的目标站点域名（默认只允许 example.com）
-3. 验证：
+1. Chrome → `chrome://extensions` → 开发者模式 → 「加载已解压的扩展程序」→ 选 `ws/extension/`；复制该扩展的 **32 位 ID**。
+2. 启动服务前**必须绑定唯一扩展 Origin**（不要写真实 token / 扩展 ID 到 Git）：
+
+   ```powershell
+   $env:BRIDGE_EXTENSION_ORIGIN = "chrome-extension://<扩展ID>"
+   python ws/server.py
+   ```
+
+   bash 下可用 `BRIDGE_EXTENSION_ORIGIN="chrome-extension://<扩展ID>" python ws/server.py`。
+   未设置或 ID 格式错误时服务拒绝启动（fail-closed）。
+3. 默认仅允许 `example.com` 的 HTTPS 页面。如需其他站点，**同时**调整 `ws/extension/background.js` 中的 `ALLOWED_HOSTS` 和 `ws/extension/manifest.json` 中的 `host_permissions`，重新加载扩展，确保权限最小化。
+4. 验证：
 
 ```bash
 python ws/ctl.py status                 # 应返回扩展侧标签页的 url/title
@@ -49,14 +57,19 @@ python ws/examples/slow_crawl.py https://example.com out.json 8   # 慢速抓取
 
 ### poll 模式
 
-```bash
-node poll/server.mjs                    # 监听 127.0.0.1:17777，token 写入 poll/.bridge_token（持久化，重启不变）
-```
+1. 先在 `chrome://extensions` 加载 `poll/extension/`，复制扩展 ID。
+2. 在控制台启动时指定其 Origin：
 
-1. 加载扩展 `poll/extension/`；在它的 Service Worker 控制台执行一次：
-   `chrome.storage.local.set({ bridgeToken: '<poll/.bridge_token 的内容>' })`
-2. 编辑 `poll/extension/background.js` 顶部 `ALLOWED_HOSTS` 与 `STAGGER_MS`
-3. 验证：
+   ```powershell
+   $env:BRIDGE_EXTENSION_ORIGIN = "chrome-extension://<扩展ID>"
+   node poll/server.mjs
+   ```
+
+   bash 下可用 `BRIDGE_EXTENSION_ORIGIN="chrome-extension://<扩展ID>" node poll/server.mjs`。
+   未设置或 ID 格式错误时服务拒绝启动。token 保存于 `poll/.bridge_token`，重启不会自动轮换。
+3. 在扩展 Service Worker 控制台配置一次 token：`chrome.storage.local.set({ bridgeToken: '<poll/.bridge_token 的内容>' })`，**不要把 token 粘贴进 Git / 聊天或公开日志**。
+4. 如需其他站点，同时修改 `poll/extension/background.js` 的 `ALLOWED_HOSTS` 和 `poll/extension/manifest.json` 的 HTTPS `host_permissions` 并重新加载扩展；仅保留必要域名。
+5. 验证：
 
 ```bash
 node poll/ctl.mjs task PING
@@ -64,6 +77,10 @@ node poll/ctl.mjs task OPEN_READ '{"url":"https://example.com"}'
 node poll/ctl.mjs receipts 5            # 看回执
 node poll/ctl.mjs status
 ```
+
+**任务保护**：`ctl.mjs task` 会拒绝覆盖未完成的 `task.json`；先执行 `status`、查看 `receipts`，确认后才通过 `reset` 明确放弃任务。失败后的 PING/OPEN_READ 允许重试，但不保证 exactly-once；未来新增任何写操作都必须设计服务端幂等键。
+
+**持久化失败必须明确失败**：`/result` 在状态文件无法读写时返回 503，不会把失败伪装为成功；`/task` 遇到损坏的任务文件也返回 503。文件写入成功不等于断电后的严格持久化保证，仍需要在真实机器上演练备份与恢复。
 
 ## 安全模型（必读）
 
@@ -73,9 +90,8 @@ node poll/ctl.mjs status
 - **控制端 token**：`/ctl`（ws）与整个 poll server 需要 token；token 是启动时随机生成、只落本机文件，
   网页拿不到。poll 模式的 token 持久化在 `.bridge_token`（删掉即轮换，扩展要重新配置）。
 - **Origin 校验**：`/ctl` 拒绝任何带 `Origin` 的连接（网页发起的 WebSocket 必带 Origin）；
-  `/ext` 只接受 `chrome-extension://` 起源；poll 的 CORS 只对 `chrome-extension://` 回显。
-  需要更紧时给 `poll/server.mjs` 设 `BRIDGE_EXTENSION_ORIGIN=chrome-extension://<你的扩展ID>`。
-- **站点白名单**：扩展侧的 `ALLOWED_HOSTS` 是打开新页面的硬闸，默认几乎为空——**必须自己填**。
+  `/ext` 与 poll 服务器均强制要求 `BRIDGE_EXTENSION_ORIGIN` 精确匹配已加载扩展 ID。其他扩展即使使用同样的 `chrome-extension://` 前缀也被拒绝；单靠 Origin 仍不能防御完全控制本机的进程。
+- **站点白名单**：扩展侧的 `ALLOWED_HOSTS` 与 manifest `host_permissions` 是两道独立边界。默认只允许示例 HTTPS 站点。除调用前与跳转后校验外，读取/滚动/点击还在页面实际脚本执行时再次校验，阻断导航竞态。变更目标域名必须同步修改两处。
 - **写操作默认关闭**：`ws` 模式的 `click` 需要把 `allowWrite` 改成 `true` 才生效。
 - **别把桥暴露给公网**：浏览器对 localhost 的访问限制（Chrome 的 Local Network Access）目前
   **尚未覆盖 WebSocket**，恶意网页直连你本机端口这件事不能指望浏览器拦，token + Origin 是硬要求。
@@ -120,28 +136,34 @@ ws/                   推模式（WebSocket，低延迟）
 poll/                 拉模式（HTTP 轮询，任务单 + 回执）
   server.mjs          任务桥服务：/task 领任务、/result 回执、receipts.jsonl 审计流水
   ctl.mjs             控制端：写任务 / 看状态 / 看回执
-  extension/          MV3 扩展：轮询领任务、taskId 幂等、串行执行
+  extension/          MV3 扩展：轮询领任务、服务端确认后标记完成、串行执行
 docs/
   security.md         威胁模型与防护
+  security-review-20261011.md  安全与恢复机制审查清单
   operations.md       多实例部署 / 回执纪律 / 已知故障（实测）
   landscape.md        生态与关键词调研
 tests/
-  test_ws_server.py   端到端测试（正向 + 反向），pytest
-  test_poll_server.mjs 端到端测试（正向 + 反向），node --test
+  test_ws_server.py            WS 端到端与重连/竞态测试，pytest
+  test_poll_server.mjs         poll 服务鉴权/幂等与边界测试，node --test
+  test_poll_cli.mjs            poll CLI 任务保护与恢复测试
+  test_poll_extension.mjs      poll 扩展轮询状态机模拟测试
+  test_poll_startup.mjs        poll 启动弱 Token 拒载测试
+  test_injected_origin_guard.mjs  注入脚本 Origin/白名单绕过防御测试
+  test_chromium_e2e.mjs        真实 Chromium MV3 扩展隔离 E2E（CI 跑通）
 ```
 
 ## 测试
 
 ```bash
-python -m pytest tests/test_ws_server.py -v     # ws：7 用例（含 5 个反向）
-node --test tests/test_poll_server.mjs          # poll：8 用例（含 5 个反向）
+python -m pytest tests/test_ws_server.py -v     # ws：9 用例（模拟扩展）
+node --test tests/test_poll_server.mjs tests/test_poll_cli.mjs tests/test_poll_extension.mjs tests/test_injected_origin_guard.mjs tests/test_poll_startup.mjs  # 28 用例，隔离/模拟
 ```
 
 测试用独立端口（28786/28777）与临时目录，不碰默认端口和本目录数据。
 
-### 真实浏览器验证（已做）
+### 真实浏览器验证与 CI 说明
 
-除单元测试外，两种模式都在真实 Chrome（154.0.8037.98）+ 真实加载的扩展上跑过完整闭环：
+除本地隔离单元测试外，`.github/workflows/bridge-chromium-e2e.yml` 使用真实 Chromium 加载 MV3 扩展针对本地回环合成页运行 E2E 校验；早期 Chrome（154.0.8037.98）真实环境还跑过完整业务链路：
 
 - **ws**：`status` / `open https://example.com`（load complete）/ `read`（正文+链接）；
   白名单反向验证：`open https://www.google.com` → 被拒（host not in ALLOWED_HOSTS）

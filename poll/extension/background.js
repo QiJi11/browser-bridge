@@ -3,7 +3,8 @@
 // 与 ws 模式的区别：扩展主动轮询领任务，天然耐断连（server 重启/扩展休眠都不丢），
 // 适合无人值守批量任务 + 需要回执审计的场景。
 //
-// 幂等：lastTaskId 存 chrome.storage.local，SW 重启/重复领取都不会重跑同一任务。
+// 恢复语义：task_done 获得服务端成功回执后才记 lastTaskId；若中途断线可再次尝试。
+// 当前动作只支持 PING / OPEN_READ；未来若新增写操作，必须先设计服务端幂等键。
 // 首次使用：在扩展的 Service Worker 控制台执行
 //   chrome.storage.local.set({ bridgeToken: '<server 端 .bridge_token 文件内容>' })
 //
@@ -46,7 +47,9 @@ function sleep(ms) {
 
 function hostAllowed(url) {
   try {
-    const h = new URL(url).hostname;
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return false;
+    const h = parsed.hostname;
     return ALLOWED_HOSTS.some((d) => h === d || h.endsWith("." + d));
   } catch {
     return false;
@@ -62,14 +65,22 @@ async function handleAction(task) {
       if (!hostAllowed(task.url || "")) throw new Error("host not in ALLOWED_HOSTS: " + task.url);
       const tab = await chrome.tabs.create({ url: task.url, active: true });
       await waitComplete(tab.id);
+      const current = await chrome.tabs.get(tab.id);
+      if (!hostAllowed(current.url || "")) throw new Error("bridge tab redirected outside ALLOWED_HOSTS");
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: (maxText) => ({
-          url: location.href,
-          title: document.title,
-          text: (document.body ? document.body.innerText : "").slice(0, maxText),
-        }),
-        args: [task.maxText || 20000],
+        func: (maxText, hosts) => {
+          // Validate in the actual document, not just tabs.get: redirects can race script injection.
+          const h = location.hostname;
+          if (location.protocol !== "https:" || !hosts.some((d) => h === d || h.endsWith("." + d)))
+            throw new Error("page navigated outside ALLOWED_HOSTS");
+          return {
+            url: location.href,
+            title: document.title,
+            text: (document.body ? document.body.innerText : "").slice(0, maxText),
+          };
+        },
+        args: [task.maxText || 20000, ALLOWED_HOSTS],
       });
       return res ? res.result : null;
     }
@@ -80,13 +91,23 @@ async function handleAction(task) {
 
 function waitComplete(tabId, timeoutMs = 45000) {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(fn); resolve("timeout"); }, timeoutMs);
+    let settled = false;
+    const timer = setTimeout(() => finish("timeout"), timeoutMs);
+    function finish(status) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(fn);
+      resolve(status);
+    }
     function fn(id, info) {
-      if (id === tabId && info.status === "complete") {
-        clearTimeout(timer); chrome.tabs.onUpdated.removeListener(fn); resolve("complete");
-      }
+      if (id === tabId && info.status === "complete") finish("complete");
     }
     chrome.tabs.onUpdated.addListener(fn);
+    // tabs.create may return after the document already finished loading.
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab.status === "complete") finish("complete");
+    }).catch(() => finish("error"));
   });
 }
 
@@ -98,8 +119,7 @@ async function tick() {
     const task = await bridgeFetch("/task");
     if (!task || task.action === "NONE" || !task.id) return;
     const { lastTaskId } = await chrome.storage.local.get("lastTaskId");
-    if (lastTaskId === task.id) return; // 幂等：同一任务只跑一次
-    await chrome.storage.local.set({ lastTaskId: task.id });
+    if (lastTaskId === task.id) return; // 已确认结案的任务无需重复处理
 
     let ok = true, data = null, error = null;
     try {
@@ -117,6 +137,8 @@ async function tick() {
       method: "POST",
       body: JSON.stringify({ type: "task_done", taskId: task.id, ok }),
     });
+    // 只有服务端确认结案后才能持久标记；否则断线/休眠会令任务永久卡死。
+    await chrome.storage.local.set({ lastTaskId: task.id });
   } catch (e) {
     // server 未起/网络抖动：留给下一次轮询，不抛
   } finally {

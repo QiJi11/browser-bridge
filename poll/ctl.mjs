@@ -28,7 +28,7 @@ function token() {
 }
 
 async function health() {
-  const r = await fetch(`http://127.0.0.1:${PORT}/health?token=${token()}`);
+  const r = await fetch(`http://127.0.0.1:${PORT}/health`, { headers: { 'x-bridge-token': token() } });
   return r.json();
 }
 
@@ -37,6 +37,24 @@ if (cmd === 'task') {
   if (!action) {
     console.error('usage: node ctl.mjs task <ACTION> [jsonPayload]');
     process.exit(1);
+  }
+  // A task is an inbox slot, not a FIFO queue. Never silently overwrite work in flight.
+  if (existsSync(TASK_FILE)) {
+    let previous;
+    try {
+      previous = JSON.parse(readFileSync(TASK_FILE, 'utf8'));
+    } catch {
+      console.error('existing task.json is unreadable; refuse to overwrite it');
+      process.exit(2);
+    }
+    if (!previous || typeof previous !== 'object' || Array.isArray(previous)) {
+      console.error('existing task.json is invalid; refuse to overwrite it');
+      process.exit(2);
+    }
+    if (previous.action !== 'NONE' && previous.done !== true) {
+      console.error('pending task exists; see status/receipts before submitting another task');
+      process.exit(2);
+    }
   }
   const payload = rest[1] ? JSON.parse(rest[1]) : {};
   const task = {
