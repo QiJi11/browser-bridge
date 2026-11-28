@@ -1,8 +1,8 @@
 # Browser Bridge 安全与恢复机制审查（2026-10-11）
 
-状态：仅 PR #1 候选分支代码与模拟 CI 已验证；未运行真实 Chrome 或 Windows 设备验收，未合并部署。
+状态：已通过隔离单元测试与 GitHub Actions Chromium MV3 合成页 E2E 回归并合入 `main`；真实登录态与 Windows ACL 仍需按部署清单在目标机器确认。
 
-## 原始 main 风险（基线 269ecf89cd）
+## 原始 main 风险（基线 fbdc02a）
 - WS `/ext` 曾只校验 `chrome-extension://` Origin 前缀；其他扩展也能使用该前缀。
 - poll `BRIDGE_EXTENSION_ORIGIN` 曾可选；控制端曾把 Token 放在 URL 查询参数中。
 - 扩展曾申请全部 HTTPS 网站权限，且存在 `tabs.get` 与页面实际执行脚本之间的导航竞态。

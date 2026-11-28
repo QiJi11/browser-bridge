@@ -139,11 +139,17 @@ poll/                 拉模式（HTTP 轮询，任务单 + 回执）
   extension/          MV3 扩展：轮询领任务、服务端确认后标记完成、串行执行
 docs/
   security.md         威胁模型与防护
+  security-review-20261011.md  安全与恢复机制审查清单
   operations.md       多实例部署 / 回执纪律 / 已知故障（实测）
   landscape.md        生态与关键词调研
 tests/
-  test_ws_server.py   端到端测试（正向 + 反向），pytest
-  test_poll_server.mjs 端到端测试（正向 + 反向），node --test
+  test_ws_server.py            WS 端到端与重连/竞态测试，pytest
+  test_poll_server.mjs         poll 服务鉴权/幂等与边界测试，node --test
+  test_poll_cli.mjs            poll CLI 任务保护与恢复测试
+  test_poll_extension.mjs      poll 扩展轮询状态机模拟测试
+  test_poll_startup.mjs        poll 启动弱 Token 拒载测试
+  test_injected_origin_guard.mjs  注入脚本 Origin/白名单绕过防御测试
+  test_chromium_e2e.mjs        真实 Chromium MV3 扩展隔离 E2E（CI 跑通）
 ```
 
 ## 测试
@@ -155,9 +161,9 @@ node --test tests/test_poll_server.mjs tests/test_poll_cli.mjs tests/test_poll_e
 
 测试用独立端口（28786/28777）与临时目录，不碰默认端口和本目录数据。
 
-### 历史真实浏览器验证（旧版，当前安全加固分支尚未重新做）
+### 真实浏览器验证与 CI 说明
 
-除单元测试外，两种模式都在真实 Chrome（154.0.8037.98）+ 真实加载的扩展上跑过完整闭环：
+除本地隔离单元测试外，`.github/workflows/bridge-chromium-e2e.yml` 使用真实 Chromium 加载 MV3 扩展针对本地回环合成页运行 E2E 校验；早期 Chrome（154.0.8037.98）真实环境还跑过完整业务链路：
 
 - **ws**：`status` / `open https://example.com`（load complete）/ `read`（正文+链接）；
   白名单反向验证：`open https://www.google.com` → 被拒（host not in ALLOWED_HOSTS）
